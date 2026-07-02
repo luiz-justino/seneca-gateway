@@ -19,6 +19,7 @@ type GatewayResult = {
     // Extracted from Error object
     error$: {
       name: string
+      id: string
       code?: string
       message?: string
       details?: any
@@ -39,7 +40,7 @@ type GatewayResult = {
 
 // See defaults below for behaviour.
 type GatewayOptions = {
-  allow: any
+  allow: Record<string, boolean | (string | object)[]>
   custom: any
   fixed: any
   timeout: {
@@ -65,13 +66,34 @@ function gateway(this: any, options: GatewayOptions) {
   const Patrun = seneca.util.Patrun
   const Jsonic = seneca.util.Jsonic
   const allowed = new Patrun({ gex: true })
+  const errid = seneca.util.Nid({ length: 9 })
 
   const checkAllowed = null != options.allow
 
   if (checkAllowed) {
-    for (let patStr in options.allow) {
-      let pat = Jsonic(patStr)
-      allowed.add(pat, true)
+    for (let msgCanon in options.allow) {
+      let msgCanonObj = Jsonic(msgCanon)
+      let paramPats = options.allow[msgCanon]
+      let paramPatObjs
+
+      let paramAllowed = false
+
+      if (true === paramPats) {
+        paramAllowed = true
+      }
+      else if (Array.isArray(paramPats)) {
+        paramPatObjs = paramPats.map(pp => Jsonic(pp))
+        paramAllowed = 0 < paramPatObjs.length ?
+          paramPatObjs.reduce((patrun: typeof Patrun, pp: object) =>
+            (patrun.add(pp, JSON.stringify(pp).replace(/"/g, ''))), new Patrun({ gex: true })) :
+          true
+      }
+
+      if (options.debug.log) {
+        root.log.debug('gateway-allow-pattern', msgCanonObj, paramPatObjs)
+      }
+
+      allowed.add(msgCanonObj, paramAllowed)
     }
   }
 
@@ -129,11 +151,12 @@ function gateway(this: any, options: GatewayOptions) {
 
 
   // Handle inbound JSON, converting it into a message, and submitting to Seneca.
-  async function handler(json: any, ctx: any) {
+  async function handler(json: any, ctx?: any) {
     if (options.debug.log) {
       root.log.debug('gateway-handler-json', { json })
     }
 
+    const gateway$ = ctx?.gateway$ || {}
     const seneca = await prepare(json, ctx)
     const rawmsg = tu.internalize_msg(seneca, json)
     const msg = seneca.util.clean(rawmsg)
@@ -151,6 +174,8 @@ function gateway(this: any, options: GatewayOptions) {
     return await new Promise(async (resolve) => {
       if (checkAllowed) {
         let allowMsg = false
+        let allowParams = null
+
 
         // First, find msg that will be called
         let msgdef = seneca.find(msg)
@@ -159,20 +184,29 @@ function gateway(this: any, options: GatewayOptions) {
           // Second, check found msg matches allowed patterns
           // NOTE: just doing allowed.find(msg) will enable separate messages
           // to sneak in: if foo:1 is allowed but not defined, foo:1,role:seneca,...
-          // will still work, which is not what we want!
-          allowMsg = !!allowed.find(msgdef.msgcanon)
+          // will still work, which is not what we want! However we also need
+          // to check that any additional message parameters not in the msg canon also match.
+          allowParams = allowed.find(msgdef.msgcanon)
         }
         else {
           seneca.log.debug('msg-not-found', { msg })
         }
 
+
+        if (true === allowParams) {
+          allowMsg = true
+        }
+        else if (allowParams?.find) {
+          allowMsg = allowParams.find(msg)
+        }
+
+
         if (!allowMsg) {
           let errdesc: any = {
             name: 'Error',
+            id: errid(),
             code: 'not-allowed',
             message: 'Message not allowed',
-            details: undefined,
-            pattern: undefined,
             allowed: undefined,
           }
 
@@ -182,16 +216,31 @@ function gateway(this: any, options: GatewayOptions) {
           }
 
           if (options.debug.log) {
-            seneca.log.debug('handler-not-allowed', { allowMsg, errdesc, msgdef, msg })
+            seneca.log.debug('handler-not-allowed',
+              { allowMsg, pattern: msgdef?.pattern, errdesc, msgdef, msg })
           }
 
           return resolve({
             error: true,
+
+            // Follow seneca transport structure
             out: {
-              meta$: { id: rawmsg.id$ },
+              ...nundef(errdesc),
+
+              meta$: {
+                id: rawmsg.id$,
+                error: true
+              },
+
+              // DEPRECATED: backwards compat
               error$: nundef(errdesc)
             }
           })
+        }
+        else {
+          if (options.debug.log) {
+            seneca.log.debug('handler-allowed', { pattern: msgdef.pattern, params: allowMsg })
+          }
         }
       }
 
@@ -208,6 +257,10 @@ function gateway(this: any, options: GatewayOptions) {
 
       if (options.debug.log) {
         seneca.log.debug('handler-act', { msg })
+      }
+
+      if (gateway$.local) {
+        msg.local$ = true
       }
 
       seneca.act(msg, async function(this: any, err: any, out: any, meta: any) {
@@ -242,15 +295,16 @@ function gateway(this: any, options: GatewayOptions) {
 
         if (err) {
           result.error = true
-          result.out = {
+          out.meta$.error = true
+
+          result.out = nundef({
             meta$: out.meta$,
-            error$: nundef({
-              name: err.name,
-              code: (err as any).code,
-              message: options.error.message ? err.message : undefined,
-              details: options.error.details ? err.details : undefined,
-            })
-          }
+            name: err.name,
+            id: (err as any).id || errid(),
+            code: (err as any).code,
+            message: options.error.message ? err.message : undefined,
+            details: options.error.details ? err.details : undefined,
+          })
         }
 
         resolve(result)
@@ -318,6 +372,7 @@ function gateway(this: any, options: GatewayOptions) {
 
   return {
     exports: {
+      prepare,
       handler,
       parseJSON,
     }
